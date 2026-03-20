@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Literal
+from typing import Any
 from .base import BaseTool
 
 logger = logging.getLogger(__name__)
@@ -12,71 +12,51 @@ def _bytes_to_gb(b: int) -> float:
     return round(b / (1024 ** 3), 2)
 
 
-def _qemu_disks(proxmox, node: str, vmid: int) -> list[dict]:
+def _guest_fsinfo(proxmox, node: str, vmid: str) -> list[dict]:
     """
-    Parse disk info from QEMU VM config.
-    Returns list of disks with device, storage, size, and format.
+    Query filesystem usage via QEMU guest agent (get-fsinfo).
+    Returns a list of mount points with used/total/free bytes.
+    Only works on running VMs with the guest agent installed.
     """
-    disks = []
+    filesystems = []
     try:
-        config = proxmox.nodes(node).qemu(vmid).config.get()
-        disk_keys = [k for k in config if k.startswith(("scsi", "virtio", "ide", "sata"))]
-        for key in disk_keys:
-            value = config[key]
-            # Skip cd-rom drives and non-disk entries
-            if "media=cdrom" in value or value == "none":
+        result = proxmox.nodes(node).qemu(vmid).agent("get-fsinfo").get()
+        for fs in result.get("result", []):
+            name        = fs.get("name", "")
+            mountpoint  = fs.get("mountpoint", "")
+            fs_type     = fs.get("type", "")
+            total_bytes = fs.get("total-bytes", 0) or 0
+            used_bytes  = fs.get("used-bytes",  0) or 0
+            free_bytes  = total_bytes - used_bytes
+
+            # Skip pseudo/virtual filesystems
+            if fs_type in ("tmpfs", "devtmpfs", "devpts", "sysfs", "proc",
+                           "cgroup", "cgroup2", "overlay", "squashfs"):
                 continue
-            # Format: storage:vm-100-disk-0,size=32G,...
-            parts = value.split(",")
-            storage_disk = parts[0]
-            size_str = next((p.split("=")[1] for p in parts if p.startswith("size=")), "N/A")
-            storage = storage_disk.split(":")[0] if ":" in storage_disk else "N/A"
-            disks.append({
-                "device":  key,
-                "storage": storage,
-                "size":    size_str,
-                "raw":     storage_disk,
+
+            filesystems.append({
+                "name":         name,
+                "mountpoint":   mountpoint,
+                "type":         fs_type,
+                "total_gb":     _bytes_to_gb(total_bytes),
+                "used_gb":      _bytes_to_gb(used_bytes),
+                "free_gb":      _bytes_to_gb(free_bytes),
+                "used_percent": round(used_bytes / total_bytes * 100, 1) if total_bytes else 0,
             })
+        logger.info("qemu/%s: got fsinfo for %d filesystem(s) via guest agent", vmid, len(filesystems))
     except Exception as e:
-        logger.error("Failed to get disk config for qemu/%s on %s: %s", vmid, node, e)
-    return disks
+        logger.debug("qemu/%s: guest agent fsinfo not available: %s", vmid, e)
+    return filesystems
 
 
-def _lxc_disks(proxmox, node: str, vmid: int) -> list[dict]:
-    """
-    Parse disk info from LXC container config.
-    Returns list of mount points with storage and size.
-    """
-    disks = []
-    try:
-        config = proxmox.nodes(node).lxc(vmid).config.get()
-        disk_keys = [k for k in config if k.startswith(("rootfs", "mp"))]
-        for key in disk_keys:
-            value = config[key]
-            parts = value.split(",")
-            storage_disk = parts[0]
-            size_str = next((p.split("=")[1] for p in parts if p.startswith("size=")), "N/A")
-            storage = storage_disk.split(":")[0] if ":" in storage_disk else "N/A"
-            disks.append({
-                "device":  key,
-                "storage": storage,
-                "size":    size_str,
-                "raw":     storage_disk,
-            })
-    except Exception as e:
-        logger.error("Failed to get disk config for lxc/%s on %s: %s", vmid, node, e)
-    return disks
-
-
-def _storage_usage(proxmox, node: str) -> list[dict]:
-    """Return usage stats for every storage pool visible on the node."""
-    storages = []
+def _storage_pools(proxmox, node: str) -> list[dict]:
+    pools = []
     try:
         for s in proxmox.nodes(node).storage.get():
             total = s.get("total", 0)
             used  = s.get("used",  0)
             avail = s.get("avail", 0)
-            storages.append({
+            pools.append({
                 "storage":      s.get("storage"),
                 "type":         s.get("type"),
                 "total_gb":     _bytes_to_gb(total),
@@ -86,8 +66,39 @@ def _storage_usage(proxmox, node: str) -> list[dict]:
                 "active":       s.get("active", 0) == 1,
             })
     except Exception as e:
-        logger.error("Failed to get storage for node %s: %s", node, e)
-    return storages
+        logger.error("Failed to get storage pools for node %s: %s", node, e)
+    return pools
+
+
+def _parse_vm_disks(config: dict, kind: str) -> list[dict]:
+    """Parse disk device entries from a VM/CT config — allocated size only."""
+    disks = []
+    prefixes = ("scsi", "virtio", "ide", "sata") if kind == "qemu" else ("rootfs", "mp")
+    skip_keys = {"scsihw"} if kind == "qemu" else set()
+
+    for key in config:
+        if key in skip_keys:
+            continue
+        if not key.startswith(prefixes):
+            continue
+        value = config[key]
+        if not isinstance(value, str):
+            continue
+        if "media=cdrom" in value or value == "none":
+            continue
+
+        parts    = value.split(",")
+        vol      = parts[0]
+        size_str = next((p.split("=")[1] for p in parts if p.startswith("size=")), "N/A")
+        storage  = vol.split(":")[0] if ":" in vol else "N/A"
+
+        disks.append({
+            "device":    key,
+            "storage":   storage,
+            "allocated": size_str,
+            "volume":    vol,
+        })
+    return disks
 
 
 # ── tool ───────────────────────────────────────────────────────────────────────
@@ -102,8 +113,10 @@ class ListDisksTool(BaseTool):
     def description(self) -> str:
         return (
             "List disk information for the Proxmox cluster. "
-            "Shows per-VM/container disk devices and sizes, "
-            "plus storage pool usage (total, used, available GB) per node. "
+            "Shows storage pool totals per node. "
+            "For each VM/container: disk devices with allocated size. "
+            "For running QEMU VMs with the guest agent: real per-filesystem usage "
+            "(used, free, total GB per mount point). "
             "Optionally filter by a specific VM ID."
         )
 
@@ -123,44 +136,54 @@ class ListDisksTool(BaseTool):
             node = node_info["node"]
             node_result = {"storage_pools": [], "vms": []}
 
-            # Storage pool usage
-            node_result["storage_pools"] = _storage_usage(self.proxmox, node)
+            node_result["storage_pools"] = _storage_pools(self.proxmox, node)
 
             # QEMU VMs
             try:
-                vms = self.proxmox.nodes(node).qemu.get()
-                for vm in vms:
-                    vid = str(vm.get("vmid"))
+                for vm in self.proxmox.nodes(node).qemu.get():
+                    vid    = str(vm.get("vmid"))
+                    status = vm.get("status")
                     if vmid_filter and vid != str(vmid_filter):
                         continue
-                    disks = _qemu_disks(self.proxmox, node, vid)
+
+                    config = self.proxmox.nodes(node).qemu(vid).config.get()
+                    disks  = _parse_vm_disks(config, "qemu")
+
+                    # Guest agent fsinfo only available on running VMs
+                    filesystems = []
+                    if status == "running":
+                        filesystems = _guest_fsinfo(self.proxmox, node, vid)
+
                     node_result["vms"].append({
-                        "type":   "qemu",
-                        "vmid":   vid,
-                        "name":   vm.get("name", f"vm-{vid}"),
-                        "status": vm.get("status"),
-                        "disks":  disks,
+                        "type":        "qemu",
+                        "vmid":        vid,
+                        "name":        vm.get("name", f"vm-{vid}"),
+                        "status":      status,
+                        "disks":       disks,
+                        "filesystems": filesystems,  # empty if stopped or no agent
                     })
-                    logger.info("qemu/%s: %d disk(s)", vid, len(disks))
             except Exception as e:
                 logger.error("Failed to fetch QEMU VMs on node %s: %s", node, e)
 
             # LXC containers
             try:
-                containers = self.proxmox.nodes(node).lxc.get()
-                for ct in containers:
-                    vid = str(ct.get("vmid"))
+                for ct in self.proxmox.nodes(node).lxc.get():
+                    vid    = str(ct.get("vmid"))
+                    status = ct.get("status")
                     if vmid_filter and vid != str(vmid_filter):
                         continue
-                    disks = _lxc_disks(self.proxmox, node, vid)
+
+                    config = self.proxmox.nodes(node).lxc(vid).config.get()
+                    disks  = _parse_vm_disks(config, "lxc")
+
                     node_result["vms"].append({
-                        "type":   "lxc",
-                        "vmid":   vid,
-                        "name":   ct.get("name", f"ct-{vid}"),
-                        "status": ct.get("status"),
-                        "disks":  disks,
+                        "type":        "lxc",
+                        "vmid":        vid,
+                        "name":        ct.get("name", f"ct-{vid}"),
+                        "status":      status,
+                        "disks":       disks,
+                        "filesystems": [],  # LXC: no guest agent
                     })
-                    logger.info("lxc/%s: %d disk(s)", vid, len(disks))
             except Exception as e:
                 logger.error("Failed to fetch LXC containers on node %s: %s", node, e)
 
@@ -174,7 +197,8 @@ class ListDisksTool(BaseTool):
         async def list_disks(vmid: str = "") -> str:
             """
             List disk information for the Proxmox cluster.
-            Shows per-VM disk devices and sizes, plus storage pool usage per node.
+            Shows storage pool totals, disk devices with allocated size,
+            and real filesystem usage per mount point for running VMs with guest agent.
             Optionally pass a vmid to filter to a single VM or container.
             """
             args = {}
