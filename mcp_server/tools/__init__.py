@@ -10,10 +10,12 @@ That's it — the server picks it up automatically.
 from proxmoxer import ProxmoxAPI
 from .base import BaseTool
 from .list_vms import ListVMsTool
+from .list_disks import ListDisksTool
 
 # ── Register tools here ────────────────────────────────────────────────────────
 _TOOL_CLASSES = [
     ListVMsTool,
+    ListDisksTool
 ]
 
 
