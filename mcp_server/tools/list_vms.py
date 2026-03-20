@@ -1,7 +1,9 @@
 import json
-from typing import Any
-from mcp.types import TextContent
+import logging
+from typing import Any, Literal
 from .base import BaseTool
+
+logger = logging.getLogger(__name__)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -11,7 +13,6 @@ def _bytes_to_gb(b: int) -> float:
 
 
 def _qemu_ip(proxmox, node: str, vmid: int) -> str:
-    """Fetch IP via QEMU guest agent. Returns 'N/A' on any failure."""
     try:
         ifaces = proxmox.nodes(node).qemu(vmid).agent("network-get-interfaces").get()
         for iface in ifaces.get("result", []):
@@ -23,20 +24,19 @@ def _qemu_ip(proxmox, node: str, vmid: int) -> str:
                     ip = addr["ip-address"]
                     if not ip.startswith("127."):
                         return ip
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Could not get IP for qemu/%s on %s (guest agent may not be running): %s", vmid, node, e)
     return "N/A"
 
 
 def _lxc_ip(proxmox, node: str, vmid: int) -> str:
-    """Fetch IP from LXC network interfaces. Returns 'N/A' on any failure."""
     try:
         for iface in proxmox.nodes(node).lxc(vmid).interfaces.get():
             addr = iface.get("inet", "")
             if addr and not addr.startswith("127."):
                 return addr.split("/")[0]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Could not get IP for lxc/%s on %s: %s", vmid, node, e)
     return "N/A"
 
 
@@ -75,50 +75,63 @@ class ListVMsTool(BaseTool):
             "uptime, and basic I/O counters."
         )
 
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "status_filter": {
-                    "type": "string",
-                    "enum": ["all", "running", "stopped"],
-                    "default": "all",
-                    "description": "Filter VMs by status.",
-                }
-            },
-            "required": [],
-        }
-
-    async def run(self, arguments: dict[str, Any]) -> list[TextContent]:
+    async def run(self, arguments: dict[str, Any]) -> str:
         status_filter = arguments.get("status_filter", "all")
         results = []
 
-        for node_info in self.proxmox.nodes.get():
+        logger.info("Fetching nodes from Proxmox...")
+        try:
+            nodes = self.proxmox.nodes.get()
+        except Exception as e:
+            logger.error("Failed to fetch nodes: %s", e)
+            return f"Error: could not connect to Proxmox — {e}"
+
+        logger.info("Found %d node(s): %s", len(nodes), [n["node"] for n in nodes])
+
+        for node_info in nodes:
             node = node_info["node"]
 
             # QEMU VMs
             try:
-                for vm in self.proxmox.nodes(node).qemu.get(full=1):
+                vms = self.proxmox.nodes(node).qemu.get(full=1)
+                logger.info("Node %s: found %d QEMU VM(s)", node, len(vms))
+                for vm in vms:
                     running = vm.get("status") == "running"
                     ip = _qemu_ip(self.proxmox, node, vm["vmid"]) if running else "N/A"
                     results.append(_format_vm(vm, node, "qemu", ip))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Failed to fetch QEMU VMs on node %s: %s", node, e)
 
             # LXC containers
             try:
-                for ct in self.proxmox.nodes(node).lxc.get():
+                containers = self.proxmox.nodes(node).lxc.get()
+                logger.info("Node %s: found %d LXC container(s)", node, len(containers))
+                for ct in containers:
                     running = ct.get("status") == "running"
                     ip = _lxc_ip(self.proxmox, node, ct["vmid"]) if running else "N/A"
                     results.append(_format_vm(ct, node, "lxc", ip))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Failed to fetch LXC containers on node %s: %s", node, e)
+
+        logger.info("Total VMs/containers collected: %d", len(results))
 
         if status_filter != "all":
             results = [v for v in results if v["status"] == status_filter]
+            logger.info("After filter '%s': %d result(s)", status_filter, len(results))
 
         if not results:
-            return [TextContent(type="text", text="No VMs found matching the filter.")]
+            return "No VMs found matching the filter."
 
-        return [TextContent(type="text", text=json.dumps(results, indent=2))]
+        return json.dumps(results, indent=2)
+
+    def as_fastmcp_fn(self):
+        tool_self = self
+
+        async def list_vms(status_filter: Literal["all", "running", "stopped"] = "all") -> str:
+            """
+            List all QEMU VMs and LXC containers on the Proxmox cluster.
+            Returns name, type, node, status, CPU %, RAM usage, IP address, uptime, and basic I/O counters.
+            """
+            return await tool_self.run({"status_filter": status_filter})
+
+        return list_vms

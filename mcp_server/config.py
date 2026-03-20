@@ -1,7 +1,19 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
+from dotenv import load_dotenv
 
-
+# auto search for .env in case it is moved
+_PROJECT_ROOT = Path(__file__).parent.parent
+for _candidate in [
+    Path.cwd() / ".env",
+    _PROJECT_ROOT / ".env",
+    Path(__file__).parent / ".env",
+]:
+    if _candidate.exists():
+        load_dotenv(_candidate)
+        break
+ 
 @dataclass
 class ProxmoxConfig:
     host: str
@@ -11,7 +23,7 @@ class ProxmoxConfig:
     password: str
     token_name: str
     token_value: str
-
+ 
     def validate(self):
         if not self.host:
             raise ValueError("PROXMOX_HOST is not set.")
@@ -21,8 +33,8 @@ class ProxmoxConfig:
             raise ValueError(
                 "Set PROXMOX_PASSWORD, or both PROXMOX_TOKEN_NAME and PROXMOX_TOKEN_VALUE."
             )
-
-
+ 
+ 
 def load_config() -> ProxmoxConfig:
     cfg = ProxmoxConfig(
         host=os.environ.get("PROXMOX_HOST", ""),

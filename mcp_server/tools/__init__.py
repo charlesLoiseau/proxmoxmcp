@@ -14,8 +14,6 @@ from .list_vms import ListVMsTool
 # ── Register tools here ────────────────────────────────────────────────────────
 _TOOL_CLASSES = [
     ListVMsTool,
-    # NodeStatsTool,   ← future example
-    # StartVMTool,
 ]
 
 
