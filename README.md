@@ -2,37 +2,17 @@
 
 Expose your Proxmox VE cluster to Claude as MCP tools.
 
-## Project structure
-
-```
-proxmox-mcp/
-├── main.py                        # Entry point
-├── requirements.txt
-└── proxmox_mcp/
-    ├── config.py                  # Env-var config (edit once)
-    ├── client.py                  # Proxmox API client factory
-    ├── server.py                  # MCP wiring (never needs to change)
-    └── tools/
-        ├── __init__.py            # ← Register new tools here
-        ├── base.py                # BaseTool ABC
-        └── list_vms.py            # Tool: list VMs & containers
-```
-
-### Adding a new tool
-
-1. Create `proxmox_mcp/tools/your_tool.py` — subclass `BaseTool`, implement `name`, `description`, `input_schema`, and `run`.
-2. Open `proxmox_mcp/tools/__init__.py` and append `YourTool` to `_TOOL_CLASSES`.
-
-Done. The server picks it up automatically.
-
----
-
 ## Setup
 
 ### 1. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+uv run main.py
+```
+
+#### 1.1 Test the agent
+```bash
+uv run mcp dev main.py
 ```
 
 ### 2. Create a Proxmox API token (recommended)
@@ -49,20 +29,6 @@ Datacenter → Permissions → Add → API Token Permission
   Token: root@pam!mcp
   Role:  PVEAuditor
 ```
-
-### 3. Environment variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `PROXMOX_HOST` | ✅ | IP or hostname |
-| `PROXMOX_USER` | ✅ | e.g. `root@pam` |
-| `PROXMOX_TOKEN_NAME` | ✅* | Token ID (e.g. `mcp`) |
-| `PROXMOX_TOKEN_VALUE` | ✅* | Token secret |
-| `PROXMOX_PASSWORD` | alt | Password auth (less secure) |
-| `PROXMOX_PORT` | optional | Default `8006` |
-| `PROXMOX_VERIFY_SSL` | optional | `true`/`false` (default `false`) |
-
----
 
 ## Claude Desktop configuration
 
@@ -93,5 +59,8 @@ Datacenter → Permissions → Add → API Token Permission
 | Tool | Description |
 |---|---|
 | `list_vms` | List all VMs/containers with CPU %, RAM, IP, uptime, I/O |
+|`list_disk`| List storage pool information and disk usage on qemu vm with agent installed|
+|`list_qemu`| get information on the qemu agent |
 
 > **IP addresses for QEMU VMs** require the QEMU guest agent to be running inside the VM (`apt install qemu-guest-agent`). LXC containers don't need it.
+> **Disk space** require QEMU guest agent to be running on the vm
